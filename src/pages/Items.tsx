@@ -22,6 +22,7 @@ type ItemRow = MasterItem & {
 const empty: MasterItem = {
   pnaPartNo: "",
   supplierPartNo: "",
+  barcode: "",
   description: "",
   category: "",
   supplier: "",
@@ -135,6 +136,7 @@ export default function Items({ db }: { db: DbData }) {
           i.description.toLowerCase().includes(n) ||
           i.supplier.toLowerCase().includes(n) ||
           i.supplierPartNo.toLowerCase().includes(n) ||
+          (i.barcode ?? "").toLowerCase().includes(n) ||
           (i.sparePart?.machineModel ?? "").toLowerCase().includes(n)
         );
       });
@@ -191,6 +193,7 @@ export default function Items({ db }: { db: DbData }) {
       render: (r) => <Badge tone="info">{r.category || "OTHERS"}</Badge>,
     },
     { key: "spn", header: "Supplier Part No", value: (r) => r.supplierPartNo, render: (r) => <span className="font-mono text-xs">{r.supplierPartNo}</span> },
+    { key: "barcode", header: "Barcode", value: (r) => r.barcode ?? "", render: (r) => <span className="font-mono text-xs">{r.barcode || "—"}</span> },
     { key: "desc", header: "Description", value: (r) => r.description, render: (r) => <span className="block max-w-64 truncate" title={r.description}>{r.description}</span> },
     { key: "sup", header: "Supplier", value: (r) => r.supplier, render: (r) => <span className="block max-w-44 truncate" title={r.supplier}>{r.supplier}</span> },
     { key: "uom", header: "UoM", value: (r) => r.uom },
@@ -360,6 +363,9 @@ export default function Items({ db }: { db: DbData }) {
             </Field>
             <Field label="Supplier Part No">
               <input className="input" value={edit.supplierPartNo} onChange={(e) => setEdit({ ...edit, supplierPartNo: e.target.value })} />
+            </Field>
+            <Field label="Barcode / GTIN">
+              <input className="input font-mono" value={edit.barcode ?? ""} placeholder="UPC, EAN, Code 128…" onChange={(e) => setEdit({ ...edit, barcode: e.target.value.trim() })} />
             </Field>
             <Field label="Description">
               <input className="input" value={edit.description} onChange={(e) => setEdit({ ...edit, description: e.target.value })} />
