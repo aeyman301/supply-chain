@@ -4,6 +4,8 @@ export interface MasterItem {
   id?: string;
   pnaPartNo: string;
   supplierPartNo: string;
+  /** Optional barcode / GTIN used by the warehouse scanner. */
+  barcode?: string;
   description: string;
   category: string;
   supplier: string;

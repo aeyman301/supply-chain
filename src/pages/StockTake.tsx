@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { Card, DataTable, Modal, Field, Badge, SearchBox, exportCsv, Stat, type Column } from "../components/ui";
 import { fmtQty, monthLabel, todayISO, currentMonth } from "../lib/format";
 import { dbPush, dbSet, dbPushMany, dbRemove } from "../lib/db";
@@ -10,6 +10,13 @@ import type { DbData } from "../db-context";
 // countedQty === undefined. Treat null/undefined uniformly as "not counted".
 const isCounted = (l: StockTakeLine) => l.countedQty !== null && l.countedQty !== undefined;
 const varianceOf = (l: StockTakeLine) => (isCounted(l) ? (l.countedQty as number) - l.systemQty : 0);
+
+type BarcodeDetectorLike = {
+  detect: (source: HTMLVideoElement) => Promise<Array<{ rawValue: string }>>;
+};
+type BarcodeDetectorConstructor = new (
+  options?: { formats?: string[] }
+) => BarcodeDetectorLike;
 
 function stockToLines(db: DbData): Record<string, StockTakeLine> {
   const map: Record<string, StockTakeLine> = {};
@@ -39,6 +46,19 @@ export default function StockTakePage({ db }: { db: DbData }) {
   const [newName, setNewName] = useState("");
   const [newRemarks, setNewRemarks] = useState("");
   const [busy, setBusy] = useState(false);
+  const [scanCode, setScanCode] = useState("");
+  const [scanMessage, setScanMessage] = useState<{ text: string; ok: boolean } | null>(null);
+  const [cameraOn, setCameraOn] = useState(false);
+  const [cameraError, setCameraError] = useState("");
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const scanInputRef = useRef<HTMLInputElement>(null);
+  const scanValuesRef = useRef<{ sessionId: string; counts: Record<string, number | null> }>({
+    sessionId: "",
+    counts: {},
+  });
+  const scanQueuesRef = useRef<Record<string, Promise<void>>>({});
+  const scanHandlerRef = useRef<(code: string) => void>(() => undefined);
+  const lastCameraScanRef = useRef<{ code: string; at: number }>({ code: "", at: 0 });
 
   const takes = useMemo(
     () => [...db.stockTakes].sort((a, b) => b.createdAt - a.createdAt),
@@ -98,6 +118,141 @@ export default function StockTakePage({ db }: { db: DbData }) {
     if (!sel) return;
     await dbSet(`stockTakes/${sel.id}/lines/${key}`, line);
   };
+
+  const scanBarcode = (rawCode: string) => {
+    if (!sel || sel.status === "CLOSED") return;
+    const code = rawCode.trim();
+    if (!code) return;
+    const normalize = (value: string | undefined) => (value ?? "").trim().toLocaleUpperCase();
+    const normalized = normalize(code);
+    const sessionLines = Object.entries(sel.lines ?? {});
+
+    let match = sessionLines.find(([, line]) => normalize(line.partNo) === normalized);
+    let item: (typeof db.items)[number] | undefined;
+    if (!match) {
+      const candidates = db.items.filter((candidate) =>
+        [candidate.barcode, candidate.pnaPartNo, candidate.supplierPartNo].some(
+          (value) => normalize(value) === normalized
+        )
+      );
+      const uniqueParts = [...new Map(candidates.map((candidate) => [candidate.pnaPartNo, candidate])).values()];
+      if (uniqueParts.length > 1) {
+        setScanMessage({ text: `Barcode ${code} matches multiple items. Make the item barcode unique.`, ok: false });
+        return;
+      }
+      item = uniqueParts[0];
+      if (item) {
+        match = sessionLines.find(([, line]) => normalize(line.partNo) === normalize(item!.pnaPartNo));
+      }
+    }
+
+    if (!match && !item) {
+      setScanMessage({ text: `No item found for barcode “${code}”. Add it to Master Items first.`, ok: false });
+      return;
+    }
+
+    const key = match?.[0] ?? sanitizeKey(item!.pnaPartNo);
+    const current = match?.[1] ?? {
+      partNo: item!.pnaPartNo,
+      description: item!.description ?? "",
+      supplier: item!.supplier ?? "",
+      uom: item!.uom || "PC",
+      systemQty: 0,
+      countedQty: null,
+      remarks: "",
+    };
+    if (scanValuesRef.current.sessionId !== sel.id) {
+      scanValuesRef.current = {
+        sessionId: sel.id,
+        counts: Object.fromEntries(sessionLines.map(([lineKey, line]) => [lineKey, line.countedQty ?? null])),
+      };
+    }
+    const previous = scanValuesRef.current.counts[key] ?? 0;
+    const updated: StockTakeLine = { ...current, countedQty: previous + 1 };
+    scanValuesRef.current.counts[key] = updated.countedQty;
+
+    // Serialize writes for this line so a rapid sequence of scans cannot land out of order.
+    const path = `stockTakes/${sel.id}/lines/${key}`;
+    const prior = scanQueuesRef.current[path] ?? Promise.resolve();
+    const next = prior.catch(() => undefined).then(() => dbSet(path, updated));
+    scanQueuesRef.current[path] = next;
+    void next.catch((error: unknown) => {
+      setScanMessage({ text: `Count update failed: ${error instanceof Error ? error.message : String(error)}`, ok: false });
+    });
+    setScanMessage({ text: `${updated.partNo} · counted ${updated.countedQty} ${updated.uom}`, ok: true });
+  };
+  scanHandlerRef.current = scanBarcode;
+  useEffect(() => {
+    if (!sel || sel.status === "CLOSED") setCameraOn(false);
+  }, [sel?.id, sel?.status]);
+
+  const submitScan = (event: FormEvent) => {
+    event.preventDefault();
+    scanBarcode(scanCode);
+    setScanCode("");
+    scanInputRef.current?.focus();
+  };
+
+  useEffect(() => {
+    if (!cameraOn) return;
+    let stopped = false;
+    let stream: MediaStream | null = null;
+    let timer = 0;
+    const Detector = (window as unknown as { BarcodeDetector?: BarcodeDetectorConstructor }).BarcodeDetector;
+    if (!Detector) {
+      setCameraError("Live camera scanning is not supported in this browser. Use a USB/Bluetooth scanner or type the code below.");
+      setCameraOn(false);
+      return;
+    }
+    setCameraError("");
+    let detector: BarcodeDetectorLike;
+    try {
+      detector = new Detector({ formats: ["ean_13", "ean_8", "upc_a", "upc_e", "code_128", "code_39", "itf", "qr_code"] });
+    } catch {
+      detector = new Detector();
+    }
+    const start = async () => {
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera access requires a secure HTTPS connection.");
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
+        if (stopped) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        const video = videoRef.current;
+        if (!video) return;
+        video.srcObject = stream;
+        await video.play();
+        const detect = async () => {
+          if (stopped || !videoRef.current) return;
+          try {
+            const results = await detector.detect(videoRef.current);
+            const value = results[0]?.rawValue?.trim();
+            const now = Date.now();
+            if (value) {
+              const isNewLabel = value !== lastCameraScanRef.current.code || now - lastCameraScanRef.current.at > 900;
+              lastCameraScanRef.current = { code: value, at: now };
+              if (isNewLabel) scanHandlerRef.current(value);
+            }
+          } catch {
+            // Frames can be undecodable while the camera is moving; keep scanning.
+          }
+          if (!stopped) timer = window.setTimeout(detect, 180);
+        };
+        void detect();
+      } catch (error) {
+        setCameraError(error instanceof Error ? error.message : "Could not start camera.");
+        setCameraOn(false);
+      }
+    };
+    void start();
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+      stream?.getTracks().forEach((track) => track.stop());
+      if (videoRef.current) videoRef.current.srcObject = null;
+    };
+  }, [cameraOn]);
 
   const post = async () => {
     if (!sel || !stats) return;
@@ -570,6 +725,52 @@ export default function StockTakePage({ db }: { db: DbData }) {
               <Stat label="Variance Qty" value={`${stats.varianceQty > 0 ? "+" : ""}${fmtQty(stats.varianceQty)}`} tone={stats.varianceQty < 0 ? "danger" : "ok"} />
               <Stat label="Variance Value" tone={stats.varianceValue < 0 ? "danger" : "ok"} value={`${stats.varianceValue < 0 ? "-" : ""}${Math.abs(stats.varianceValue).toLocaleString("en-US", { maximumFractionDigits: 0 })} RM`} />
             </div>
+
+            <Card title="Barcode Count Scanner" className="mb-3" right={
+              <div className="flex gap-2">
+                <button
+                  className={cameraOn ? "btn-danger" : "btn-secondary"}
+                  disabled={sel.status === "CLOSED"}
+                  onClick={() => {
+                    setCameraError("");
+                    setCameraOn((on) => !on);
+                  }}
+                >
+                  {cameraOn ? "■ Stop camera" : "▣ Use camera"}
+                </button>
+              </div>
+            }>
+              <p className="text-xs text-slate-500 mb-2">
+                Scan a registered item barcode (or part number) to add one unit to its counted quantity. Register barcode values in Master Items. USB/Bluetooth scanners that type and press Enter work here too.
+              </p>
+              <form className="flex flex-col sm:flex-row gap-2" onSubmit={submitScan}>
+                <input
+                  ref={scanInputRef}
+                  className="input font-mono"
+                  value={scanCode}
+                  placeholder="Scan barcode, then press Enter…"
+                  disabled={sel.status === "CLOSED"}
+                  onChange={(event) => setScanCode(event.target.value)}
+                  autoComplete="off"
+                  autoFocus
+                />
+                <button type="submit" className="btn-primary shrink-0" disabled={sel.status === "CLOSED" || !scanCode.trim()}>
+                  Add scan (+1)
+                </button>
+              </form>
+              {scanMessage && (
+                <p role="status" className={`text-sm mt-2 ${scanMessage.ok ? "text-emerald-400" : "text-rose-400"}`}>
+                  {scanMessage.text}
+                </p>
+              )}
+              {cameraError && <p role="alert" className="text-sm text-amber-400 mt-2">{cameraError}</p>}
+              {cameraOn && (
+                <div className="mt-3 max-w-lg rounded-lg overflow-hidden bg-black">
+                  <video ref={videoRef} className="w-full max-h-72 object-contain" muted playsInline />
+                  <p className="text-xs text-slate-300 px-3 py-2">Point the rear camera at a barcode. Camera access is used only while this panel is open.</p>
+                </div>
+              )}
+            </Card>
 
             <div className="flex gap-2 mb-2">
               <SearchBox value={q} onChange={setQ} placeholder="Search part / description…" />
